@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldCorrectionIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -28,6 +28,9 @@ app = FastAPI(
         "支持野外终端离线短号记录的整包汇入（/field-packages）："
         "短号对照随包建立地层与跨包不可改绑的终端绑定，证据编号由终端/包号/序号稳定确定，"
         "整包最终关系核验、原子递增一次正式修订，同终端同包号内容重试幂等返回原结果；"
+        "支持野外整包勘误（/field-packages/corrections）：单事务撤回原包全部证据并以"
+        "未使用的新包号汇入替代内容，原包须未被替换且证据全部生效，成功只递增一次正式"
+        "修订并记录替换链，同（原包, 新包）同内容重试幂等返回原结果；"
         "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
         "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
         "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
@@ -208,6 +211,38 @@ def get_field_package(terminal_id: str, package_no: str):
     `GET /field-packages?terminal_id=...&package_no=...`。
     """
     return field_svc.get_field_package(terminal_id, package_no)
+
+
+# ------------------------------------------------------------------ 野外整包勘误
+@app.post("/field-packages/corrections", tags=["field-packages"])
+def post_field_package_correction(body: FieldCorrectionIn):
+    """野外整包勘误：单事务撤回原包全部证据并以新包号汇入替代内容。
+
+    - 请求带原终端号、原包号、新包号、预期正式修订号，以及新包的站点、
+      短号对照与带序号断言；新包号须未使用且不同于原包号
+      （400 FIELD_CORRECTION_SAME_PACKAGE / 409 FIELD_PACKAGE_NO_TAKEN）；
+    - 原包须已汇入（404 FIELD_PACKAGE_NOT_FOUND）、未被替换
+      （409 FIELD_PACKAGE_ALREADY_REPLACED）、证据全部仍生效
+      （409 FIELD_PACKAGE_EVIDENCE_INACTIVE）；
+    - 新包沿用整包汇入的短号 / 序号 / 端点 / 站点 / 跨包绑定 / 稳定证据编号
+      规则（400 UNKNOWN_SHORT_CODE 等、409 SITE_CONFLICT / SHORT_CODE_REBOUND /
+      FIELD_EVIDENCE_TAKEN）；
+    - 一次事务撤回原包证据、汇入新包并对最终断言集核验组内早于与早于闭环
+      （409 FIELD_CORRECTION_CONFLICT 附证据路径）；任一错误或冲突都不改变
+      地层、绑定、断言、台账与修订；成功只递增一次正式修订，关系变化以
+      source=field_package_correction 记录，替换链落勘误台账；
+    - 相同（终端, 原包号, 新包号）+ 相同内容重试返回首次结果（replayed=true，
+      即使正式修订已前进）；异内容复用 409 FIELD_CORRECTION_CONTENT_MISMATCH；
+      首次勘误的过期修订 409 STALE_REVISION；
+    - 原包台账行不修改不删除：原包原请求重放仍返回首次汇入结果。
+    """
+    return field_svc.correct_field_package(body)
+
+
+@app.get("/field-packages/corrections", tags=["field-packages"])
+def list_field_package_corrections():
+    """野外整包勘误台账：替换链逐环记录（原包号 → 新包号、撤回证据、首次响应）。"""
+    return field_svc.list_field_package_corrections()
 
 
 # ------------------------------------------------------------------ 关系查询

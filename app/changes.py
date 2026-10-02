@@ -146,6 +146,8 @@ def backfill_revision_changes(cur) -> int:
             source = "projection_merge"
         elif isinstance(batch, dict) and batch.get("source") == "field_package":
             source = "field_package"
+        elif isinstance(batch, dict) and batch.get("source") == "field_package_correction":
+            source = "field_package_correction"
         else:
             source = "formal_batch"
         insert_revision_changes(cur, revision, diffs, source)

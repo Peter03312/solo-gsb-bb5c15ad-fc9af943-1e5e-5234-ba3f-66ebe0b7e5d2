@@ -87,7 +87,25 @@
     台账可读：`GET /field-packages`（不带参数为摘要列表；同带
     `?terminal_id=...&package_no=...` 为详情）或路径形式
     `GET /field-packages/{terminal_id}/{package_no}`（终端/包号含 `/` 时用查询参数形式），
-    含内容指纹与首次响应，不存在返回 404 `FIELD_PACKAGE_NOT_FOUND`。
+    含内容指纹与首次响应，不存在返回 404 `FIELD_PACKAGE_NOT_FOUND`；列表与详情均带
+    `replaces_package_no` / `replaced_by_package_no` 替换链字段（未经勘误的包为 null）。
+- **野外整包勘误**：`POST /field-packages/corrections` 更正已成功汇入的整包。请求携带
+  原终端号、原包号、新包号、预期正式修订号，以及新包的站点、短号对照与带序号断言：
+  - 新包号须**未使用且不同于原包号**；原包须**存在、未被替换、证据全部仍生效**；
+  - 新包沿用整包汇入的全部规则：短号、序号、端点、站点、跨包绑定与稳定证据编号
+    （证据编号按**新包号**生成）；
+  - **一次事务**撤回原包全部证据、汇入新包，并对最终断言集核验组内早于与早于闭环；
+    任一错误或冲突都不改变地层、绑定、断言、台账与修订；成功**只递增一次正式修订**，
+    关系变化以 `field_package_correction` 来源进入 `/revision-changes`，替换链
+    （原包 → 新包）落勘误台账；同一原包只被替换一次，新包可再被勘误（链式）；
+  - **幂等**：相同（终端, 原包号, 新包号）+ 相同内容（指纹不含 `expected_revision`、
+    与数组顺序无关）重试返回首次结果（`replayed=true`），即使正式修订已前进；
+    异内容复用拒绝（409 `FIELD_CORRECTION_CONTENT_MISMATCH`）；首次勘误仍做过期
+    修订校验（409 `STALE_REVISION`）；
+  - 原包台账行不修改不删除：**原包原请求重放仍返回首次汇入结果**；历史定版与推演
+    冻结结果不受影响。新包作为普通包入台账（同内容经 `/field-packages` 重放命中其
+    首次响应）；包台账列表 / 详情带 `replaces_package_no` / `replaced_by_package_no`
+    串起替换链，勘误台账 `GET /field-packages/corrections` 逐环可查。
 
 ## 快速开始
 
@@ -126,7 +144,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/strata` | 地层列表 |
 | POST | `/batches` | 提交一批断言新增/撤回（整批核验，成功原子递增修订号） |
 | POST | `/field-packages` | 野外终端离线整包汇入：短号对照建层/绑定、稳定证据编号、整批核验、幂等返回原结果 |
-| GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 野外汇入包台账列表 / 详情（内容指纹与首次响应；终端或包号含 `/` 等路径保留字符时用 `/field-packages?terminal_id=...&package_no=...`） |
+| POST | `/field-packages/corrections` | 野外整包勘误：单事务撤回原包全部证据并以未使用的新包号汇入替代内容，只递增一次正式修订并记录替换链；同（原包, 新包）同内容重试幂等返回原结果 |
+| GET | `/field-packages/corrections` | 野外整包勘误台账：替换链逐环记录（原包号 → 新包号、撤回证据编号、首次响应） |
+| GET | `/field-packages` / `/field-packages/{terminal_id}/{package_no}` | 野外汇入包台账列表 / 详情（内容指纹与首次响应；含 `replaces_package_no` / `replaced_by_package_no` 替换链字段；终端或包号含 `/` 等路径保留字符时用 `/field-packages?terminal_id=...&package_no=...`） |
 | POST | `/batches/preflight` | 提交前只读预检：求消除冲突所需撤回的最少生效旧证据（预算 0～3），不落库 |
 | GET | `/revision` | 当前修订号 |
 | GET | `/assertions?status=active` | 断言列表 |
@@ -350,6 +370,105 @@ F:<base64url(terminal_id)>:<base64url(package_no)>:<seq 补零 12 位>
 
 ```bash
 bash examples/field_packages_demo.sh
+```
+
+### 野外整包勘误：`POST /field-packages/corrections`
+
+已成功汇入的整包若需更正（如方向记反、序号誊错），不必手工逐条撤回：以**新包号**
+整包勘误，一次事务撤回原包全部证据并汇入替代内容。请求体：
+
+```json
+{
+  "terminal_id": "T-07",
+  "original_package_no": "2026-09-01-03",
+  "new_package_no": "2026-09-01-03-c1",
+  "expected_revision": 1,
+  "site": "西山坡",
+  "mappings": [
+    {"short_code": "s1", "stratum_id": "XSP-01"},
+    {"short_code": "s2", "stratum_id": "XSP-02"},
+    {"short_code": "s3", "stratum_id": "XSP-03"}
+  ],
+  "assertions": [
+    {"seq": 1, "stratum_a": "s1", "stratum_b": "s2", "relation": "same_period"},
+    {"seq": 2, "stratum_a": "s3", "stratum_b": "s2", "relation": "earlier_than"}
+  ]
+}
+```
+
+- `terminal_id` / `original_package_no` / `new_package_no`：原终端号、原包号、新包号。
+  新包号须**未使用且不同于原包号**；新包与原包同属该终端；
+- `site` / `mappings[]` / `assertions[]`：新包内容，**沿用整包汇入的全部规则**
+  （短号不重复、序号不重复、端点只引本包短号、站点一致、跨包不可改绑、稳定证据编号
+  按**新包号**生成 `F:<base64url(终端)>:<base64url(新包号)>:<12位序号>`）；
+- `expected_revision`：预期正式修订号。首次勘误过期返回 409 `STALE_REVISION`；
+  **幂等重试不检查修订号**。
+
+**前置校验**（任一不满足即拒绝，状态不变）：
+
+| 情形 | HTTP | code |
+| --- | --- | --- |
+| 新包号与原包号相同 | 400 | `FIELD_CORRECTION_SAME_PACKAGE` |
+| 原包不存在 | 404 | `FIELD_PACKAGE_NOT_FOUND` |
+| 原包已被替换（同一原包只被勘误一次） | 409 | `FIELD_PACKAGE_ALREADY_REPLACED` |
+| 新包号已被使用 | 409 | `FIELD_PACKAGE_NO_TAKEN` |
+| 原包证据未全部生效（如已被正式批次撤回） | 409 | `FIELD_PACKAGE_EVIDENCE_INACTIVE`（`details.inactive_evidence_ids`） |
+| 新包结构 / 站点 / 绑定 / 编号问题 | 400/409 | 沿用整包汇入错误码（`UNKNOWN_SHORT_CODE`、`SITE_CONFLICT`、`SHORT_CODE_REBOUND`、`FIELD_EVIDENCE_TAKEN` 等） |
+
+**事务语义**：一次事务内撤回原包全部证据（只置状态、历史可查）、按汇入规则落地
+新包的地层 / 绑定 / 断言，再对**最终断言集**核验组内早于与早于闭环——冲突时整批
+拒绝（409 `FIELD_CORRECTION_CONFLICT`，`details.conflicts[]` 附证据路径），
+**地层、绑定、断言、台账、修订均不变**。成功时**只递增一次正式修订**，与关系变化
+记录（`source=field_package_correction`）、`revisions` 审计、新包台账、勘误台账
+**同事务提交**。
+
+成功响应（`retracted_evidence` 为被撤回的原包证据编号，`evidence` 为新包稳定编号）：
+
+```json
+{
+  "site": "西山坡",
+  "terminal_id": "T-07",
+  "original_package_no": "2026-09-01-03",
+  "new_package_no": "2026-09-01-03-c1",
+  "revision": 2,
+  "retracted_evidence": ["F:VC0wNw:MjAyNi0wOS0wMS0wMw:000000000001", "F:VC0wNw:MjAyNi0wOS0wMS0wMw:000000000002"],
+  "mappings": [
+    {"short_code": "s1", "stratum_id": "XSP-01", "site": "西山坡", "already_registered": true}
+  ],
+  "evidence": [
+    {"seq": 1, "evidence_id": "F:VC0wNw:MjAyNi0wOS0wMS0wMy1jMQ:000000000001",
+     "stratum_a": "XSP-01", "stratum_b": "XSP-02", "relation": "same_period"}
+  ],
+  "applied": 2,
+  "retracted": 2,
+  "relation_changes": 3,
+  "replayed": false
+}
+```
+
+**幂等与替换链**：
+
+| 情形 | 结果 |
+| --- | --- |
+| 同（终端, 原包号, 新包号）+ 同内容重试（任何修订号、任何时机） | HTTP 200，返回**首次勘误响应**原样，`replayed=true`，修订不再前进 |
+| 同（原包, 新包）+ 异内容 | 409 `FIELD_CORRECTION_CONTENT_MISMATCH`（`details` 给双指纹） |
+| 原包已被勘误过（换任何新包号再勘误） | 409 `FIELD_PACKAGE_ALREADY_REPLACED`（`details` 给已替换到的包号与修订号） |
+| 新包可再被勘误 | 形成替换链 原包 → 新包 → …，逐环落勘误台账 |
+
+勘误内容指纹对新包 `site`、规范化（排序）后的 `mappings` / `assertions` 及原包号、
+新包号取 sha256，**不含 `expected_revision`、与数组顺序无关**。
+
+**历史可查性**：原包台账行不修改不删除——**原包原请求重放仍返回首次汇入结果**
+（`replayed=true`）；勘误前定版与推演冻结结果保持原结论可查。新包作为普通包入
+`field_packages` 台账：同内容经 `POST /field-packages` 重放命中其首次响应，异内容
+复用按 `FIELD_PACKAGE_CONTENT_MISMATCH` 拒绝。包台账列表 / 详情带
+`replaces_package_no`（本包替换了哪个原包）/ `replaced_by_package_no`
+（本包被哪个新包替换）串起替换链；勘误台账
+`GET /field-packages/corrections` 逐环给出原包号 → 新包号、撤回证据编号、
+首次响应与勘误修订号。
+
+```bash
+bash examples/field_correction_demo.sh
 ```
 
 ### 关系查询响应
@@ -678,13 +797,20 @@ bash examples/arrangement_demo.sh
 | 409 | `FIELD_CONFLICT` | 野外包：整包最终关系核验冲突（附证据路径），地层/绑定/断言均不落地 |
 | 409 | `FIELD_PACKAGE_CONTENT_MISMATCH` | 野外包：同终端同包号已以不同内容汇入，异内容复用拒绝 |
 | 404 | `FIELD_PACKAGE_NOT_FOUND` | 野外汇入包台账中不存在该终端 + 包号 |
+| 400 | `FIELD_CORRECTION_SAME_PACKAGE` | 整包勘误：新包号与原包号相同 |
+| 409 | `FIELD_PACKAGE_ALREADY_REPLACED` | 整包勘误：原包已被替换（同一原包只被勘误一次） |
+| 409 | `FIELD_PACKAGE_EVIDENCE_INACTIVE` | 整包勘误：原包证据未全部生效（`details.inactive_evidence_ids`） |
+| 409 | `FIELD_PACKAGE_NO_TAKEN` | 整包勘误：新包号已被使用 |
+| 409 | `FIELD_CORRECTION_CONTENT_MISMATCH` | 整包勘误：同（原包, 新包）已以不同内容勘误，异内容复用拒绝 |
+| 409 | `FIELD_CORRECTION_CONFLICT` | 整包勘误：撤回原包证据并汇入新包后的最终断言集核验冲突（附证据路径），状态不变 |
 
 ## 正式修订关系变化追踪
 
 考古人员需要按正式修订追踪**关系结论及支撑证据**的变化。服务对每次成功的
 **正式断言批次**（`POST /batches`）、**推演并入产生的正式修订**
-（`POST /projections/{id}/merge` 且实际递增修订号）与**野外整包汇入产生的正式修订**
-（`POST /field-packages`）记录变化明细。
+（`POST /projections/{id}/merge` 且实际递增修订号）与**野外整包汇入 / 整包勘误
+产生的正式修订**（`POST /field-packages`、`POST /field-packages/corrections`）
+记录变化明细。
 
 **记录口径**
 
@@ -742,7 +868,8 @@ bash examples/arrangement_demo.sh
 ```
 
 `source`：`formal_batch`（正式断言批次）/ `projection_merge`（推演并入产生的
-正式修订）/ `field_package`（野外整包汇入产生的正式修订）。
+正式修订）/ `field_package`（野外整包汇入产生的正式修订）/
+`field_package_correction`（野外整包勘误产生的正式修订）。
 
 **历史修订可追溯**：服务启动时幂等检查 `revisions` 审计，对部署前已存在、尚未
 追踪的历史修订按当时断言集（`added_revision` / `retracted_revision` 回放）重算
@@ -991,6 +1118,14 @@ bash examples/packages_demo.sh
 bash examples/field_packages_demo.sh
 ```
 
+野外整包勘误演示（单事务撤回原包证据并以新包号汇入、只递增一次修订、替换链、
+同（原包, 新包）同内容幂等 / 异内容拒绝、原包已替换 / 新包号占用 / 证据失效 /
+最终断言集冲突整批拒绝、原包原请求重放与历史定版不变）：
+
+```bash
+bash examples/field_correction_demo.sh
+```
+
 Python 客户端示例：
 
 ```bash
@@ -1004,7 +1139,7 @@ python3 examples/client_demo.py
 app/
   main.py         # FastAPI 路由与错误处理
   service.py      # 正式批次核验、关系查询、定版快照
-  field.py        # 野外终端离线整包汇入：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等
+  field.py        # 野外终端离线整包汇入与整包勘误：短号建层/跨包绑定、稳定证据编号、整批核验、包台账与勘误台账幂等、替换链
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
@@ -1025,6 +1160,7 @@ examples/
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
+  field_correction_demo.sh # 野外整包勘误示例（撤回原包证据+新包号汇入/替换链/幂等/拒绝分支/历史可查）
   client_demo.py    # Python 客户端示例
 Dockerfile
 docker-compose.yml

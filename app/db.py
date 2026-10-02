@@ -125,8 +125,9 @@ CREATE TABLE IF NOT EXISTS revision_changes (
     -- 当时的最优支撑证据路径；关系未定（含变为未定）时为空数组 []
     old_path     JSONB NOT NULL,
     new_path     JSONB NOT NULL,
-    -- formal_batch=正式断言批次；projection_merge=推演并入（历史回填时来源按审计还原）
-    source       TEXT NOT NULL CHECK (source IN ('formal_batch', 'projection_merge')),
+    -- formal_batch=正式断言批次；projection_merge=推演并入；field_package=野外整包汇入；
+    -- field_package_correction=野外整包勘误（历史回填时来源按审计还原）
+    source       TEXT NOT NULL CHECK (source IN ('formal_batch', 'projection_merge', 'field_package', 'field_package_correction')),
     PRIMARY KEY (revision, seq),
     UNIQUE (revision, stratum_a, stratum_b)
 );
@@ -190,10 +191,34 @@ CREATE TABLE IF NOT EXISTS field_packages (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (terminal_id, package_no)
 );
+
+-- 野外整包勘误台账：一次事务撤回原包全部证据并以新包号汇入替代内容。
+-- 同一（终端, 原包号, 新包号）只成功一次：同内容重试原样返回 stored_response
+-- （即使正式修订已前进），异内容复用拒绝；同一原包号只被替换一次（唯一索引
+-- 保证），替换链 原包 -> 新包 -> … 由本表逐环记录；原包台账行不修改不删除，
+-- 原请求重放仍返回首次汇入结果。
+CREATE TABLE IF NOT EXISTS field_package_corrections (
+    terminal_id          TEXT NOT NULL,
+    original_package_no  TEXT NOT NULL,
+    new_package_no       TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,                    -- 勘误内容指纹（不含 expected_revision）
+    expected_revision    INTEGER NOT NULL,                 -- 首次成功时携带的预期修订号
+    applied_revision     INTEGER NOT NULL,                 -- 勘误实际递增到的正式修订号
+    retracted_evidence   JSONB NOT NULL,                   -- 随勘误撤回的原包证据编号（按编号排序）
+    stored_response      JSONB NOT NULL,                   -- 首次成功响应（同内容重试原样返回）
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, original_package_no, new_package_no)
+);
+-- 同一原包只被替换一次；新包号同时是 field_packages 的包号，至多由一次勘误产生
+CREATE UNIQUE INDEX IF NOT EXISTS idx_field_pkg_corr_original
+    ON field_package_corrections (terminal_id, original_package_no);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_field_pkg_corr_new
+    ON field_package_corrections (terminal_id, new_package_no);
 """
 
 # revision_changes.source 增加 field_package（野外整包汇入）。
-# 约束放宽是幂等的：全新库的上面 CREATE 已带三值 CHECK，DO 块检测到一致即跳过。
+# 约束放宽是幂等的：全新库的上面 CREATE 已带含 field_package 的 CHECK，
+# DO 块检测到一致即跳过；更早部署的存量库在此放宽。
 SCHEMA += """
 DO $$
 DECLARE
@@ -206,6 +231,24 @@ BEGIN
         ALTER TABLE revision_changes DROP CONSTRAINT revision_changes_source_check;
         ALTER TABLE revision_changes ADD CONSTRAINT revision_changes_source_check
             CHECK (source IN ('formal_batch', 'projection_merge', 'field_package'));
+    END IF;
+END$$;
+"""
+
+# revision_changes.source 再增加 field_package_correction（野外整包勘误）。
+# 同样幂等：已含该值的约束（含全新库 CREATE 与上一 DO 块刚放宽的）直接跳过。
+SCHEMA += """
+DO $$
+DECLARE
+    c TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO c
+    FROM pg_constraint
+    WHERE conrelid = 'revision_changes'::regclass AND conname = 'revision_changes_source_check';
+    IF c IS NOT NULL AND c NOT LIKE '%field_package_correction%' THEN
+        ALTER TABLE revision_changes DROP CONSTRAINT revision_changes_source_check;
+        ALTER TABLE revision_changes ADD CONSTRAINT revision_changes_source_check
+            CHECK (source IN ('formal_batch', 'projection_merge', 'field_package', 'field_package_correction'));
     END IF;
 END$$;
 """

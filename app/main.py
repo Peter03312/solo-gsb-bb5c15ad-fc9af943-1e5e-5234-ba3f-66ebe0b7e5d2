@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.8.0",
+    version="1.9.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -28,6 +28,10 @@ app = FastAPI(
         "支持野外终端离线短号记录的整包汇入（/field-packages）："
         "短号对照随包建立地层与跨包不可改绑的终端绑定，证据编号由终端/包号/序号稳定确定，"
         "整包最终关系核验、原子递增一次正式修订，同终端同包号内容重试幂等返回原结果；"
+        "支持已汇入整包勘误（/field-packages/corrections）："
+        "单事务撤回原包全部证据并以未使用的新包号汇入勘误包、最终关系核验，"
+        "成功只递增一次正式修订并记录替换链，同原包同新包内容重试幂等返回首次勘误结果，"
+        "原包台账、历史定版与推演冻结结果保持可查，原包号原请求重放仍返回首次汇入结果；"
         "支持只读分期骨架视图（/periodization）：同一期等价组与组间传递约简后的直接早于边；"
         "支持只读分期试排（/periodization/arrangement 与 /projections/{id}/periodization/arrangement）："
         "在总期数（1～64）与地层期位锚点约束下，返回每个同一期等价组在所有可行排布中的最早/最晚期位，"
@@ -206,8 +210,97 @@ def get_field_package(terminal_id: str, package_no: str):
 
     终端编号 / 包号含 '/' 等路径保留字符时改用
     `GET /field-packages?terminal_id=...&package_no=...`。
+    已被勘误替换的原包仍可查（status=superseded），并回带 replacement_chain 替换链；
+    原包 stored_response 永不修改——原包号原请求重放仍返回首次汇入结果。
     """
     return field_svc.get_field_package(terminal_id, package_no)
+
+
+# ------------------------------------------------------------------ 野外整包勘误替换
+@app.post("/field-packages/corrections", tags=["field-packages"])
+def post_field_package_correction(body: FieldPackageCorrectionIn):
+    """已成功汇入野外整包的勘误：撤回原包证据并以新包号汇入勘误新包（单事务）。
+
+    - 接收原终端号、原包号、新包号、预期正式修订号，以及新包的站点、短号对照与
+      带序号断言；新包号须未使用且不同于原包号
+      （400 FIELD_CORRECTION_SAME_PACKAGE / 409 FIELD_PACKAGE_NO_TAKEN）；
+    - 原包必须存在（404 FIELD_PACKAGE_NOT_FOUND）、未被替换
+      （409 FIELD_PACKAGE_ALREADY_REPLACED），且原包证据须全部仍生效
+      （409 FIELD_PACKAGE_EVIDENCE_INACTIVE）；
+    - 新包沿用现有短号、序号、端点、站点、跨包绑定及稳定证据编号规则
+      （UNKNOWN_SHORT_CODE / DUPLICATE_SHORT_CODE / DUPLICATE_SEQUENCE /
+      SITE_CONFLICT / SHORT_CODE_REBOUND / FIELD_EVIDENCE_TAKEN）；
+    - 一次事务撤回原包证据、汇入新包并对最终断言集核验组内早于和闭环
+      （冲突 409 FIELD_CORRECTION_CONFLICT 附证据路径）：任一错误或冲突均不改变
+      地层、绑定、断言、台账和修订；成功只递增一次正式修订，并记录关系变化
+      （source=field_package_correction）与替换链；
+    - 同一原包与新包的相同内容重试，即使修订已前进也返回首次勘误结果
+      （replayed=true）；异内容复用 409 FIELD_CORRECTION_CONTENT_MISMATCH；
+      首次勘误的过期修订 409 STALE_REVISION；
+    - 原包台账、历史定版与推演冻结结果保持可查；原包号原请求 POST /field-packages
+      重放仍返回首次汇入结果。
+    """
+    return field_svc.correct_field_package(body)
+
+
+@app.get("/field-packages/corrections", tags=["field-packages"])
+def list_field_package_corrections(
+    terminal_id: Optional[str] = Query(default=None, description="终端编号（可选过滤）"),
+    original_package_no: Optional[str] = Query(default=None, description="原包号（与 terminal_id、new_package_no 同时给出时返回该条勘误详情）"),
+    new_package_no: Optional[str] = Query(default=None, description="新包号（三者同时给出时返回该条勘误详情，便于含 / 的编号走查询参数形式）"),
+):
+    """野外整包勘误台账列表（摘要）。
+
+    - 不带参数列出全部勘误；可按 terminal_id 过滤；给 terminal_id 与
+      original_package_no 时只列该原包的勘误历史（一个原包至多有一条成功勘误，
+      新包之后可继续被勘误，形成替换链）；
+    - terminal_id / original_package_no / new_package_no 三者同时给出时返回该条
+      勘误详情（终端或包号含 '/' 等路径保留字符时用此形式代替路径段形式）。
+    """
+    if new_package_no is not None and original_package_no is None:
+        raise ApiError(
+            400,
+            "INVALID_QUERY",
+            "按 new_package_no 查询勘误详情时须同时提供 original_package_no",
+            {
+                "terminal_id": terminal_id,
+                "original_package_no": original_package_no,
+                "new_package_no": new_package_no,
+            },
+        )
+    if original_package_no is not None and new_package_no is not None:
+        if terminal_id is None:
+            raise ApiError(
+                400,
+                "INVALID_QUERY",
+                "按原包 / 新包查询勘误详情时须同时提供 terminal_id",
+                {
+                    "terminal_id": terminal_id,
+                    "original_package_no": original_package_no,
+                    "new_package_no": new_package_no,
+                },
+            )
+        return field_svc.get_field_correction(terminal_id, original_package_no, new_package_no)
+    if original_package_no is not None and terminal_id is None:
+        raise ApiError(
+            400,
+            "INVALID_QUERY",
+            "按 original_package_no 过滤时须同时提供 terminal_id",
+            {"terminal_id": terminal_id, "original_package_no": original_package_no},
+        )
+    return field_svc.list_field_corrections(terminal_id, original_package_no)
+
+
+@app.get(
+    "/field-packages/corrections/{terminal_id}/{original_package_no}/{new_package_no}",
+    tags=["field-packages"],
+)
+def get_field_package_correction(terminal_id: str, original_package_no: str, new_package_no: str):
+    """单次勘误台账详情：撤回证据清单、替换修订与首次成功响应（不存在 404）。
+
+    各编号含 '/' 等路径保留字符时改用查询参数形式 /field-packages/corrections。
+    """
+    return field_svc.get_field_correction(terminal_id, original_package_no, new_package_no)
 
 
 # ------------------------------------------------------------------ 关系查询

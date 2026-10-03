@@ -188,7 +188,32 @@ CREATE TABLE IF NOT EXISTS field_packages (
     request           JSONB NOT NULL,                      -- 规范化请求留痕
     stored_response   JSONB NOT NULL,                      -- 首次成功响应（重试原样返回）
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 勘误替换状态：active=现行（未被勘误替换）；superseded=已被勘误包替换。
+    -- 原包台账与 stored_response 永不修改（原包号原请求重放仍返回首次汇入结果），
+    -- 仅追加替换指向；替换链只增不改：新包后续也可再被勘误。
+    status            TEXT NOT NULL DEFAULT 'active'
+                          CHECK (status IN ('active', 'superseded')),
+    superseded_by_package_no TEXT,                         -- 被哪个新包号替换（终态指向链上的下一节点）
+    superseded_at     TIMESTAMPTZ,
     PRIMARY KEY (terminal_id, package_no)
+);
+
+-- 野外整包勘误台账（幂等）：以 (终端, 原包号, 新包号) 为键，同一勘误只成功一次。
+-- 成功勘误在同一事务内撤回原包全部证据、以新包号汇入新包（新建地层 / 绑定 /
+-- 稳定证据编号沿用整包汇入规则）、把原包标记为 superseded、正式修订号恰好 +1。
+-- 同键同内容重试（即使修订已前进）原样返回 stored_response；异内容拒绝。
+CREATE TABLE IF NOT EXISTS field_package_corrections (
+    terminal_id         TEXT NOT NULL,
+    original_package_no TEXT NOT NULL,
+    new_package_no      TEXT NOT NULL,
+    site                TEXT NOT NULL,
+    content_hash        TEXT NOT NULL,                     -- 新包内容指纹（口径同 field_packages）
+    expected_revision   INTEGER NOT NULL,                  -- 首次成功时携带的预期修订号
+    applied_revision    INTEGER NOT NULL,                  -- 实际递增到的正式修订号
+    retracted_evidence  JSONB NOT NULL,                    -- 撤回的原包证据编号（全部原包证据）
+    response            JSONB NOT NULL,                    -- 首次成功响应（重试原样返回，replayed 由路由层标注）
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, original_package_no, new_package_no)
 );
 """
 
@@ -208,6 +233,32 @@ BEGIN
             CHECK (source IN ('formal_batch', 'projection_merge', 'field_package'));
     END IF;
 END$$;
+"""
+
+# revision_changes.source 再增加 field_package_correction（野外整包勘误替换产生的正式修订）。
+# 同样以幂等 DO 块放宽：旧库先放宽到 field_package，再放宽到四值；全新库直接跳过。
+SCHEMA += """
+DO $$
+DECLARE
+    c TEXT;
+BEGIN
+    SELECT pg_get_constraintdef(oid) INTO c
+    FROM pg_constraint
+    WHERE conrelid = 'revision_changes'::regclass AND conname = 'revision_changes_source_check';
+    IF c IS NOT NULL AND c NOT LIKE '%field_package_correction%' THEN
+        ALTER TABLE revision_changes DROP CONSTRAINT revision_changes_source_check;
+        ALTER TABLE revision_changes ADD CONSTRAINT revision_changes_source_check
+            CHECK (source IN ('formal_batch', 'projection_merge', 'field_package', 'field_package_correction'));
+    END IF;
+END$$;
+"""
+
+# 老库 field_packages 补勘误替换列（全新库的 CREATE 已包含，ADD IF NOT EXISTS 幂等）。
+SCHEMA += """
+ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'superseded'));
+ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_by_package_no TEXT;
+ALTER TABLE field_packages ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
 """
 
 _pool: "psycopg2.pool.ThreadedConnectionPool | None" = None

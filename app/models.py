@@ -143,6 +143,27 @@ class FieldPackageIn(BaseModel):
     assertions: List[FieldAssertionIn] = Field(min_length=1, description="带包内唯一序号的断言（端点只能用本包短号）")
 
 
+class FieldPackageCorrectionIn(BaseModel):
+    """已成功汇入野外整包的勘误请求：撤回原包证据并以新包号汇入勘误后的新包。
+
+    - 新包号须未使用且不同于原包号；原包须存在、未被替换，且原包证据须全部仍生效；
+    - 新包内容（site / mappings / assertions）沿用整包汇入的全部规则：
+      短号不重复、序号不重复、端点只引本包短号、站点一致、跨包绑定不可改绑、
+      证据编号由 (终端, 新包号, 序号) 稳定确定；
+    - 首次勘误携带的 expected_revision 须为当前正式修订号；相同
+      (终端, 原包号, 新包号) + 相同内容的重试幂等返回首次结果（不校验修订号），
+      异内容复用拒绝。
+    """
+
+    terminal_id: str = Field(min_length=1, max_length=128, description="终端编号（与原包汇入终端一致）")
+    original_package_no: str = Field(min_length=1, max_length=128, description="原包号（已成功汇入、未被替换）")
+    new_package_no: str = Field(min_length=1, max_length=128, description="新包号（终端内未使用且不同于原包号）")
+    expected_revision: int = Field(ge=0, description="预期正式修订号；过期按 STALE_REVISION 拒绝（幂等重试除外）")
+    site: str = Field(min_length=1, max_length=256, description="采集站点（新包沿用汇入站点核验规则）")
+    mappings: List[FieldMappingIn] = Field(min_length=1, description="短号到全库地层编号的对照（短号不可重复）")
+    assertions: List[FieldAssertionIn] = Field(min_length=1, description="带包内唯一序号的断言（端点只能用本包短号）")
+
+
 class ResilienceIn(BaseModel):
     """证据撤回承受力分析请求（只读，不写库、不递增修订号、不产生变化记录）。
 
